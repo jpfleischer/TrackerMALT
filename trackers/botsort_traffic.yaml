@@ -1,0 +1,21 @@
+# trackers/botsort_traffic.yaml
+tracker_type: botsort
+
+# stricter update rules -> reduces "breathing" boxes (still detector-driven though)
+track_high_thresh: 0.65
+track_low_thresh: 0.20
+new_track_thresh: 0.75
+
+track_buffer: 60
+match_thresh: 0.85
+
+# required by some ultralytics builds
+fuse_score: True
+
+# fixed cam: disable global motion compensation (or set sparseOptFlow if you want)
+gmc_method: none
+
+# BoT-SORT extras
+proximity_thresh: 0.65
+appearance_thresh: 0.25
+with_reid: False
