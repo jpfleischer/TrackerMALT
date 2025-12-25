@@ -27,10 +27,11 @@ DEVICE  := 0
 
 # --- Hardcoded smoothing + drawing defaults ---
 SMOOTH_ALPHA         := 0.15
-SMOOTH_STATIONARY_PX := 2.5
+SMOOTH_STATIONARY_PX := 7
 SMOOTH_MAX_SIZE_FRAC := 0.015
 FONT_SCALE           := 0.40
-BOX_THICKNESS        := 1
+TEXT_THICKNESS	     := 2
+BOX_THICKNESS        := 3
 DRAW_CONF            := 1
 DRAW_CLASS           := 0
 
@@ -41,9 +42,10 @@ default: build run
 build:
 	docker build -t $(IMAGE) .
 
-run:
+run: network
 	-docker rm -f $(NAME) >/dev/null 2>&1 || true
 	docker run -d \
+		--network clickhouse \
 		--name $(NAME) \
 		--gpus $(GPU) \
 		--env-file .env \
@@ -69,6 +71,11 @@ run:
 		-e DRAW_CONF=$(DRAW_CONF) \
 		-e DRAW_CLASS=$(DRAW_CLASS) \
 		$(IMAGE)
+
+## Ensure docker network exists
+network:
+	@docker network inspect clickhouse >/dev/null 2>&1 || \
+		docker network create clickhouse
 
 
 logs:

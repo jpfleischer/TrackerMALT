@@ -8,17 +8,25 @@ from pathlib import Path
 from typing import Optional, List
 import datetime as dt
 from clickhouse_client import ClickHouseHTTP
+import subprocess
 
 import cv2
 import pika
 import numpy as np
 from ultralytics import YOLO
 
+import rasterio as rio
+from affine import Affine
+
+
 from box_smoothing import BoxSmootherEMA
 
 
 LOG = logging.getLogger("ultra_pipeline")
 VIDEO_BASE = Path(os.getenv("VIDEO_BASE_DIR", "/mnt/video_pipeline"))
+# === BEV / Homography inputs ===
+H_PATH     = os.getenv("H_PATH", "H_cam_to_map.npy")
+ORTHO_PATH = os.getenv("ORTHO_PATH", "ortho_zoom.tif")
 
 
 def env_float(name: str, default: float) -> float:
@@ -48,6 +56,59 @@ def publish_log(channel: pika.adapters.blocking_connection.BlockingChannel, log_
         channel.basic_publish(exchange="", routing_key=log_queue, body=msg.encode("utf-8"))
     except Exception:
         LOG.exception("Failed to publish log message to queue=%s", log_queue)
+
+def ffmpeg_compress(
+    in_path: Path,
+    out_path: Path,
+    crf: int = 28,
+    preset: str = "veryfast",
+    threads: int = 0,
+    use_nvenc: bool = True,
+    cq: int = 23,
+    nvenc_preset: str = "p4",
+) -> None:
+    """
+    Compress MP4 using either NVENC or CPU.
+    If NVENC fails (missing libnvidia-encode.so.1, no GPU passthrough, etc),
+    automatically falls back to libx264.
+    """
+    def run_cmd(cmd: list[str]) -> None:
+        subprocess.run(cmd, check=True)
+
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(in_path)]
+
+    # Try NVENC first if requested
+    if use_nvenc:
+        cmd_nv = base + [
+            "-c:v", "hevc_nvenc",  # or h264_nvenc
+            "-preset", nvenc_preset,
+            "-rc", "vbr",
+            "-cq", str(int(cq)),
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",
+            str(out_path),
+        ]
+        try:
+            run_cmd(cmd_nv)
+            return
+        except subprocess.CalledProcessError as e:
+            LOG.warning("NVENC encode failed; falling back to libx264. err=%s", e)
+
+    # CPU fallback (always works if ffmpeg has libx264)
+    cmd_cpu = base + [
+        "-c:v", "libx264",
+        "-preset", str(preset),
+        "-crf", str(int(crf)),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        str(out_path),
+    ]
+    if int(threads) > 0:
+        cmd_cpu += ["-threads", str(int(threads))]
+
+    run_cmd(cmd_cpu)
 
 
 def draw_label(
@@ -83,10 +144,11 @@ def process_video_smoothed(
     smooth_max_size_change_stationary: float,
     font_scale: float,
     box_thickness: int,
+    text_thickness: int,   # <-- ADD THIS
     draw_conf: bool = True,
     draw_class: bool = False,
     video_start_dt: Optional[dt.datetime] = None,
-    on_detections=None,  # callable(frame_idx, fps, ids, clss, confs, xyxy_i, video_start_dt)
+    on_detections=None,
 ) -> Path:
 
     """
@@ -99,7 +161,9 @@ def process_video_smoothed(
     # Output folder per video
     out_dir = out_root / video_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_video_raw = out_dir / f"{video_path.stem}_track_smooth_raw.mp4"
     out_video = out_dir / f"{video_path.stem}_track_smooth.mp4"
+
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -109,8 +173,11 @@ def process_video_smoothed(
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
+    cap.release()
+
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_video), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(out_video_raw), fourcc, fps, (w, h))
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Could not open VideoWriter: {out_video}")
@@ -189,13 +256,44 @@ def process_video_smoothed(
                     parts.append(f"{float(confs[i]):.2f}")
 
                 label = " ".join(parts)
-                draw_label(frame, label, x1i, y1i - 5, font_scale, max(1, box_thickness))
+                draw_label(frame, label, x1i, y1i - 5, font_scale, text_thickness)
+
 
         writer.write(frame)
         frame_idx += 1
 
     writer.release()
-    cap.release()
+    # compress output video
+    use_nvenc = os.getenv("OUT_USE_NVENC", "1") == "1"
+
+    # CPU (libx264) settings
+    out_crf = int(os.getenv("OUT_CRF", "28"))            # typical 18–30
+    out_preset = os.getenv("OUT_PRESET", "veryfast")     # ultrafast..veryslow
+    out_threads = int(os.getenv("OUT_THREADS", "0"))     # 0 = auto
+
+    # GPU (NVENC) settings
+    out_cq = int(os.getenv("OUT_CQ", "23"))              # typical 19–28
+    out_nvenc_preset = os.getenv("OUT_NVENC_PRESET", "p4")  # p1..p7
+
+    ffmpeg_compress(
+        out_video_raw,
+        out_video,
+        crf=out_crf,
+        preset=out_preset,
+        threads=out_threads,
+        use_nvenc=False,
+        cq=out_cq,
+        nvenc_preset=out_nvenc_preset,
+    )
+
+
+    # optionally delete the raw
+    if os.getenv("KEEP_RAW", "0") != "1":
+        try:
+            out_video_raw.unlink()
+        except Exception:
+            pass
+
     return out_video
 
 
@@ -234,11 +332,60 @@ def main() -> None:
     smooth_stationary_px = env_float("SMOOTH_STATIONARY_PX", 2.0)
     smooth_max_size_change_stationary = env_float("SMOOTH_MAX_SIZE_FRAC", 0.02)
 
-    font_scale = env_float("FONT_SCALE", 0.45)          # smaller labels
+    font_scale = env_float("FONT_SCALE", 0.45)
     box_thickness = env_int("BOX_THICKNESS", 1)
+    text_thickness = env_int("TEXT_THICKNESS", 2)
+
 
     draw_conf = env_int("DRAW_CONF", 1) == 1
     draw_class = env_int("DRAW_CLASS", 0) == 1
+
+    # --------------------------
+    # BEV / Homography setup (camera px -> ortho px -> meters)
+    # --------------------------
+    try:
+        H = np.load(H_PATH)
+        if H.shape != (3, 3):
+            raise ValueError(f"H must be 3x3, got {H.shape}")
+        LOG.info("Loaded homography: %s", H_PATH)
+    except Exception as e:
+        LOG.error("Could not load homography %s: %s", H_PATH, e)
+        H = None
+
+    ortho = None
+    ortho_w = ortho_h = None
+    ortho_transform: Optional[Affine] = None
+
+    try:
+        ortho = rio.open(ORTHO_PATH)
+        ortho_w, ortho_h = ortho.width, ortho.height
+        ortho_transform = ortho.transform
+        LOG.info("Loaded ortho: %s size=%sx%s CRS=%s", ORTHO_PATH, ortho_w, ortho_h, ortho.crs)
+    except Exception as e:
+        LOG.error("Could not open ortho %s: %s", ORTHO_PATH, e)
+        ortho = None
+
+    def cam_to_map_px(cx: float, cy: float) -> Optional[tuple[float, float]]:
+        """(cx,cy) camera px -> (mx,my) ortho px"""
+        if H is None:
+            return None
+        x, y = float(cx), float(cy)
+        w = H[2, 0]*x + H[2, 1]*y + H[2, 2]
+        if w == 0:
+            return None
+        mx = (H[0, 0]*x + H[0, 1]*y + H[0, 2]) / w
+        my = (H[1, 0]*x + H[1, 1]*y + H[1, 2]) / w
+        if not (np.isfinite(mx) and np.isfinite(my)):
+            return None
+        return float(mx), float(my)
+
+    def map_px_to_meters(mx_px: float, my_px: float) -> Optional[tuple[float, float]]:
+        """ortho px -> projected meters using GeoTIFF affine"""
+        if ortho_transform is None:
+            return None
+        X, Y = ortho_transform * (mx_px, my_px)  # (col,row) == (x_px,y_px)
+        return float(X), float(Y)
+
 
     # --------------------------
     # Optional AI timestamp reader
@@ -303,8 +450,6 @@ def main() -> None:
             LOG.info("RX filename=%r", filename)
 
             video_path = Path(filename)
-
-            # If message is a bare filename or relative path, resolve it under /mnt/video_pipeline
             if not video_path.is_absolute():
                 video_path = (VIDEO_BASE / video_path).resolve()
 
@@ -336,7 +481,8 @@ def main() -> None:
                 # IMPORTANT: requeue so it doesn't just disappear
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
                 return
-            
+
+            # AI timestamp (optional)
             video_start_dt: Optional[dt.datetime] = None
             if use_ai_ts:
                 try:
@@ -363,8 +509,7 @@ def main() -> None:
 
                 secs = float(frame_idx) / float(fps or 15.0)
 
-                # Your table requires DateTime64(3) NOT Nullable; so if AI TS missing,
-                # we must still provide a valid timestamp. Use UNIX epoch as fallback.
+                # DateTime64(3) fallback (non-null)
                 if vstart is None:
                     ts = dt.datetime(1970, 1, 1) + dt.timedelta(seconds=secs)
                 else:
@@ -372,14 +517,23 @@ def main() -> None:
 
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-                # Insert rows matching clickhouse_client.py header:
-                # video,frame,secs,timestamp,track_id,class,cam_x,cam_y,map_px_x,map_px_y,map_m_x,map_m_y
-                # For Ultralytics we don't have map coords yet, so send blanks.
-                for i, tid in enumerate(ids):
-                    x1, y1, x2, y2 = map(int, xyxy_i[i])
+                for j, tid in enumerate(ids):
+                    x1, y1, x2, y2 = map(int, xyxy_i[j])
                     cx = 0.5 * (x1 + x2)
-                    cy = float(y2)  # bottom-center footpoint (like your FastMOT code)
-                    cls_name = str(int(clss[i])) if clss is not None else "unk"
+                    cy = float(y2)  # bottom-center footpoint
+
+                    cls_name = str(int(clss[j])) if clss is not None else "unk"
+
+                    map_px_x = map_px_y = map_m_x = map_m_y = None
+                    mp = cam_to_map_px(cx, cy)
+
+                    if mp is not None and ortho_w is not None and ortho_h is not None:
+                        mx_px, my_px = mp
+                        if 0 <= mx_px < ortho_w and 0 <= my_px < ortho_h:
+                            map_px_x, map_px_y = mx_px, my_px
+                            mxy = map_px_to_meters(mx_px, my_px)
+                            if mxy is not None:
+                                map_m_x, map_m_y = mxy
 
                     ch_rows.append(
                         ",".join([
@@ -391,11 +545,13 @@ def main() -> None:
                             cls_name,
                             f"{cx:.3f}",
                             f"{cy:.3f}",
-                            "", "", "", "",   # map_px_x, map_px_y, map_m_x, map_m_y
+                            "" if map_px_x is None else f"{map_px_x:.3f}",
+                            "" if map_px_y is None else f"{map_px_y:.3f}",
+                            "" if map_m_x is None else f"{map_m_x:.3f}",
+                            "" if map_m_y is None else f"{map_m_y:.3f}",
                         ]) + "\n"
                     )
 
-                # flush periodically to keep memory bounded
                 if len(ch_rows) >= 5000:
                     ch_client.insert_csv_rows(ch_rows)
                     ch_rows.clear()
@@ -416,11 +572,14 @@ def main() -> None:
                 smooth_max_size_change_stationary=smooth_max_size_change_stationary,
                 font_scale=font_scale,
                 box_thickness=box_thickness,
+                text_thickness=text_thickness,
                 draw_conf=draw_conf,
                 draw_class=draw_class,
                 video_start_dt=video_start_dt,
                 on_detections=on_detections,
             )
+
+            # final ClickHouse flush
             if ch_client is not None and ch_rows:
                 try:
                     ch_client.insert_csv_rows(ch_rows)
@@ -435,6 +594,7 @@ def main() -> None:
             # notify downstream via qname: output path
             ch.basic_publish(exchange="", routing_key=qname, body=str(out_video).encode("utf-8"))
 
+            # ACK message (success)
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
         except Exception as e:
@@ -443,6 +603,7 @@ def main() -> None:
             # Don't poison-loop forever
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
+    # IMPORTANT: basic_consume/start_consuming MUST be OUTSIDE callback
     channel.basic_consume(queue=in_queue, on_message_callback=callback, auto_ack=False)
 
     try:
@@ -456,6 +617,12 @@ def main() -> None:
             connection.close()
         except Exception:
             pass
+        try:
+            if ortho is not None:
+                ortho.close()
+        except Exception:
+            pass
+
 
 
 if __name__ == "__main__":

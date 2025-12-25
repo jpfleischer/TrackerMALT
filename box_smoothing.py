@@ -113,23 +113,22 @@ class BoxSmootherEMA:
             if self.max_size_change_stationary > 0.0:
                 dc = np.hypot(rcx - st.cx, rcy - st.cy)
                 if dc <= self.stationary_px:
-                    # clamp rw/rh relative to previous smoothed size
                     frac = self.max_size_change_stationary
-                    min_w = st.w * (1.0 - frac)
-                    max_w = st.w * (1.0 + frac)
-                    min_h = st.h * (1.0 - frac)
-                    max_h = st.h * (1.0 + frac)
-                    rw = float(np.clip(rw, min_w, max_w))
-                    rh = float(np.clip(rh, min_h, max_h))
+                    rw = float(np.clip(rw, st.w * (1.0 - frac), st.w * (1.0 + frac)))
+                    rh = float(np.clip(rh, st.h * (1.0 - frac), st.h * (1.0 + frac)))
 
+            # keep center responsive (no lag)
+            st.cx = rcx
+            st.cy = rcy
+
+            # smooth size
             a = self.alpha
-            st.cx = a * rcx + (1.0 - a) * st.cx
-            st.cy = a * rcy + (1.0 - a) * st.cy
-            st.w  = a * rw  + (1.0 - a) * st.w
-            st.h  = a * rh  + (1.0 - a) * st.h
+            st.w = a * rw + (1.0 - a) * st.w
+            st.h = a * rh + (1.0 - a) * st.h
             st.last_frame = frame_idx
 
             out[i] = cxcywh_to_xyxy(st.cx, st.cy, st.w, st.h)
+
 
         self._cleanup(frame_idx)
         return out

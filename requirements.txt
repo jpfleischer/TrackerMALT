@@ -3,3 +3,5 @@ opencv-python-headless
 pika
 numpy
 lap>=0.5.12
+rasterio
+affine

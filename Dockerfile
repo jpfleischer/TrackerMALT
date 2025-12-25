@@ -27,6 +27,8 @@ COPY box_smoothing.py /usr/src/app/box_smoothing.py
 COPY trackers /usr/src/app/trackers
 COPY ai_timestamp_reader.py /usr/src/app/ai_timestamp_reader.py
 COPY clickhouse_client.py /usr/src/app/clickhouse_client.py
+COPY H_cam_to_map.npy /usr/src/app/H_cam_to_map.npy
+COPY ortho_zoom.tif /usr/src/app/ortho_zoom.tif
 
 
 # Default command
