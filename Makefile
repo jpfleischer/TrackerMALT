@@ -16,7 +16,7 @@ HOST_PIPE ?= /data/video_pipeline
 GPU ?= all
 
 # --- Hardcoded Ultralytics runtime defaults ---
-MODEL   := yolo11s.pt
+MODEL   := yolo11m.pt
 TRACKER := /usr/src/app/trackers/botsort_traffic.yaml
 IMGSZ   := 960
 CONF    := 0.35
@@ -27,7 +27,7 @@ DEVICE  := 0
 
 # --- Hardcoded smoothing + drawing defaults ---
 SMOOTH_ALPHA         := 0.15
-SMOOTH_STATIONARY_PX := 7
+SMOOTH_STATIONARY_PX := 2.5
 SMOOTH_MAX_SIZE_FRAC := 0.015
 FONT_SCALE           := 0.40
 TEXT_THICKNESS	     := 2

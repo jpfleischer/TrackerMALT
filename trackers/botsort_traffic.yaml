@@ -18,4 +18,5 @@ gmc_method: none
 # BoT-SORT extras
 proximity_thresh: 0.65
 appearance_thresh: 0.25
-with_reid: False
+with_reid: True
+model: auto
