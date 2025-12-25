@@ -5,3 +5,4 @@ numpy
 lap>=0.5.12
 rasterio
 affine
+python-dotenv
