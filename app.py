@@ -21,6 +21,8 @@ from affine import Affine
 
 from box_smoothing import BoxSmootherEMA
 
+US_SURVEY_FT_TO_M = 0.30480060960121924
+
 
 LOG = logging.getLogger("ultra_pipeline")
 VIDEO_BASE = Path(os.getenv("VIDEO_BASE_DIR", "/mnt/video_pipeline"))
@@ -56,6 +58,12 @@ def publish_log(channel: pika.adapters.blocking_connection.BlockingChannel, log_
         channel.basic_publish(exchange="", routing_key=log_queue, body=msg.encode("utf-8"))
     except Exception:
         LOG.exception("Failed to publish log message to queue=%s", log_queue)
+
+def is_night_window(t: dt.time) -> bool:
+    """
+    True if time-of-day is in [19:00:01, 23:59:59] OR [00:00:00, 06:59:59].
+    """
+    return (t >= dt.time(19, 0, 1)) or (t <= dt.time(6, 59, 59))
 
 def ffmpeg_compress(
     in_path: Path,
@@ -379,12 +387,18 @@ def main() -> None:
             return None
         return float(mx), float(my)
 
+
     def map_px_to_meters(mx_px: float, my_px: float) -> Optional[tuple[float, float]]:
-        """ortho px -> projected meters using GeoTIFF affine"""
+        """
+        Ortho pixel -> meters.
+
+        ortho_zoom.tif CRS is EPSG:6438 (US survey foot), so affine outputs feet.
+        Convert to meters so map_m_x/map_m_y are truly meters.
+        """
         if ortho_transform is None:
             return None
-        X, Y = ortho_transform * (mx_px, my_px)  # (col,row) == (x_px,y_px)
-        return float(X), float(Y)
+        X_ft, Y_ft = ortho_transform * (mx_px, my_px)  # CRS units: US survey feet
+        return float(X_ft) * US_SURVEY_FT_TO_M, float(Y_ft) * US_SURVEY_FT_TO_M
 
 
     # --------------------------
@@ -496,6 +510,27 @@ def main() -> None:
                     publish_log(ch, log_queue, f"[ULTRA][WARN] AI timestamp reader failed: {e}")
                     video_start_dt = None
 
+
+            # Refuse to process nighttime videos (drop message; do NOT requeue)
+            if video_start_dt is not None:
+                tod = video_start_dt.time()
+                if is_night_window(tod):
+                    msg = (
+                        f"[ULTRA] Dropping {video_key} (start={video_start_dt}) "
+                        "— nighttime window 19:00:01–06:59:59"
+                    )
+                    LOG.warning(msg)
+                    publish_log(ch, log_queue, msg)
+                    ch.basic_ack(delivery_tag=method.delivery_tag)  # drop it
+                    return
+            else:
+                # If you want to be strict: drop when timestamp is unknown
+                # (optional; remove if you prefer to process unknowns)
+                msg = f"[ULTRA] Dropping {video_key} — start time unknown (night filter enabled)"
+                LOG.warning(msg)
+                publish_log(ch, log_queue, msg)
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
 
             publish_log(ch, log_queue, f"[ULTRA] Tracking {video_path.name} (alpha={smooth_alpha})")
 
