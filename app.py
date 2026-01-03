@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import os
 import time
 import logging
@@ -23,12 +24,48 @@ from box_smoothing import BoxSmootherEMA
 
 US_SURVEY_FT_TO_M = 0.30480060960121924
 
+PAIR_W = 1280.0
+PAIR_H = 720.0
+
 
 LOG = logging.getLogger("ultra_pipeline")
 VIDEO_BASE = Path(os.getenv("VIDEO_BASE_DIR", "/mnt/video_pipeline"))
 # === BEV / Homography inputs ===
-H_PATH     = os.getenv("H_PATH", "H_cam_to_map.npy")
+H_PATH     = os.getenv("H_PATH", "451.npy")
 ORTHO_PATH = os.getenv("ORTHO_PATH", "ortho_zoom.tif")
+
+# e.g. hiv00415.mp4 -> 415
+_HIV_RE = re.compile(r"hiv(\d+)", re.IGNORECASE)
+
+def parse_hiv_number(video_key: str) -> Optional[int]:
+    m = _HIV_RE.search(video_key)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+#
+# this is messy but we do it because the camera shifts a little
+#
+
+def select_h_path(video_key: str) -> str:
+    """
+    Choose which homography npy to use based on filename.
+    Hardcode: hiv00415.mp4 .. hiv00427.mp4 uses alternate H.
+    """
+    n = parse_hiv_number(video_key)
+    if n is None:
+        raise ValueError(f"Could not parse hiv number from video key: {video_key}")
+
+    if 415 <= n <= 427:
+        # hardcoded alternate for shifted camera segment
+        LOG.info("Using shifted homography for hiv%03d", n)
+        return os.getenv("H_PATH_SHIFTED", "poseB.npy")
+
+    LOG.info("Using default homography for hiv%03d", n)
+    return H_PATH
 
 
 def env_float(name: str, default: float) -> float:
@@ -187,7 +224,6 @@ def process_video_smoothed(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_video_raw), fourcc, fps, (w, h))
     if not writer.isOpened():
-        cap.release()
         raise RuntimeError(f"Could not open VideoWriter: {out_video}")
 
     smoother = BoxSmootherEMA(
@@ -237,7 +273,8 @@ def process_video_smoothed(
 
             if on_detections is not None:
                 try:
-                    on_detections(frame_idx, fps, ids, clss, confs, xyxy_i, video_start_dt)
+                    fh, fw = frame.shape[:2]
+                    on_detections(frame_idx, fps, ids, clss, confs, xyxy_i, video_start_dt, fw, fh)
                 except Exception:
                     LOG.exception("on_detections hook failed (continuing)")
 
@@ -351,14 +388,7 @@ def main() -> None:
     # --------------------------
     # BEV / Homography setup (camera px -> ortho px -> meters)
     # --------------------------
-    try:
-        H = np.load(H_PATH)
-        if H.shape != (3, 3):
-            raise ValueError(f"H must be 3x3, got {H.shape}")
-        LOG.info("Loaded homography: %s", H_PATH)
-    except Exception as e:
-        LOG.error("Could not load homography %s: %s", H_PATH, e)
-        H = None
+    H_cache: dict[str, Optional[np.ndarray]] = {}
 
     ortho = None
     ortho_w = ortho_h = None
@@ -373,7 +403,7 @@ def main() -> None:
         LOG.error("Could not open ortho %s: %s", ORTHO_PATH, e)
         ortho = None
 
-    def cam_to_map_px(cx: float, cy: float) -> Optional[tuple[float, float]]:
+    def cam_to_map_px(H: Optional[np.ndarray], cx: float, cy: float) -> Optional[tuple[float, float]]:
         """(cx,cy) camera px -> (mx,my) ortho px"""
         if H is None:
             return None
@@ -469,6 +499,23 @@ def main() -> None:
 
             video_key = video_path.name
 
+            # --- Per-video homography selection + caching ---
+            this_h_path = select_h_path(video_key)
+
+            if this_h_path not in H_cache:
+                try:
+                    H_tmp = np.load(this_h_path)
+                    if H_tmp.shape != (3, 3):
+                        raise ValueError(f"H must be 3x3, got {H_tmp.shape}")
+                    H_cache[this_h_path] = H_tmp
+                    publish_log(ch, log_queue, f"[ULTRA] Using homography {this_h_path} for {video_key}")
+                except Exception as e:
+                    H_cache[this_h_path] = None
+                    publish_log(ch, log_queue, f"[ULTRA][ERROR] Could not load homography {this_h_path}: {e}")
+
+            H = H_cache[this_h_path]
+
+
             # --- ClickHouse skip check (optional) ---
             if ch_client is not None:
                 try:
@@ -492,7 +539,6 @@ def main() -> None:
                 LOG.error(msg)
                 publish_log(ch, log_queue, msg)
 
-                # IMPORTANT: requeue so it doesn't just disappear
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
                 return
 
@@ -536,7 +582,7 @@ def main() -> None:
 
             ch_rows: List[str] = []
 
-            def on_detections(frame_idx, fps, ids, clss, confs, xyxy_i, vstart):
+            def on_detections(frame_idx, fps, ids, clss, confs, xyxy_i, vstart, frame_w, frame_h):
                 if ch_client is None:
                     return
                 if ids is None or len(ids) == 0:
@@ -554,13 +600,21 @@ def main() -> None:
 
                 for j, tid in enumerate(ids):
                     x1, y1, x2, y2 = map(int, xyxy_i[j])
+                    # --- bottom-center footpoint in CURRENT frame pixel space ---
                     cx = 0.5 * (x1 + x2)
-                    cy = float(y2)  # bottom-center footpoint
+                    cy = float(y2)
+
+                    # --- convert to PAIRER pixel space (1280x720) before applying H ---
+                    # This makes H (fit in 1280x720) valid even if Ultralytics downsized internally.
+                    sx = PAIR_W / float(frame_w) if frame_w else 1.0
+                    sy = PAIR_H / float(frame_h) if frame_h else 1.0
+                    cx_pair = cx * sx
+                    cy_pair = cy * sy
 
                     cls_name = str(int(clss[j])) if clss is not None else "unk"
 
                     map_px_x = map_px_y = map_m_x = map_m_y = None
-                    mp = cam_to_map_px(cx, cy)
+                    mp = cam_to_map_px(H, cx_pair, cy_pair)
 
                     if mp is not None and ortho_w is not None and ortho_h is not None:
                         mx_px, my_px = mp
