@@ -6,7 +6,7 @@ import os
 import time
 import logging
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import datetime as dt
 from clickhouse_client import ClickHouseHTTP
 import subprocess
@@ -19,6 +19,7 @@ from ultralytics import YOLO
 import rasterio as rio
 from affine import Affine
 
+from homography_store import load_latest_homography_from_clickhouse
 
 from box_smoothing import BoxSmootherEMA
 
@@ -32,10 +33,25 @@ LOG = logging.getLogger("ultra_pipeline")
 VIDEO_BASE = Path(os.getenv("VIDEO_BASE_DIR", "/mnt/video_pipeline"))
 # === BEV / Homography inputs ===
 H_PATH     = os.getenv("H_PATH", "451.npy")
-ORTHO_PATH = os.getenv("ORTHO_PATH", "ortho_zoom.tif")
+
+
+# Default ortho if no per-intersection override
+DEFAULT_ORTHO_PATH = os.getenv("ORTHO_PATH_DEFAULT", "ortho_zoom.tif")
+
+# Map intersection_id -> ortho filename (inside container)
+# You can override via env (nice for deployment), e.g.
+#   ORTHO_1=/mnt/orthos/intersection_1.tif
+#   ORTHO_2=/mnt/orthos/intersection_2.tif
+ORTHO_BY_INTERSECTION = {
+    "1": "ortho_zoom.tif",    # Overseas/Roosevelt
+    "2": "truman_zoom.tif",   # Truman intersection
+}
+
 
 # e.g. hiv00415.mp4 -> 415
 _HIV_RE = re.compile(r"hiv(\d+)", re.IGNORECASE)
+_INTERSECTION_RE = re.compile(r"intersection_(\d+)", re.IGNORECASE)
+
 
 def parse_hiv_number(video_key: str) -> Optional[int]:
     m = _HIV_RE.search(video_key)
@@ -45,6 +61,26 @@ def parse_hiv_number(video_key: str) -> Optional[int]:
         return int(m.group(1))
     except Exception:
         return None
+
+
+def infer_intersection_id_from_path(video_path: Path) -> Optional[str]:
+    """
+    Walk parents like .../intersection_2/11 Thursday 2-13-2025/hiv00037.mp4
+    and return '2' (or the full name if you prefer).
+    """
+    for parent in video_path.parents:
+        m = _INTERSECTION_RE.fullmatch(parent.name)
+        if m:
+            # return just the number, or parent.name if you want 'intersection_2'
+            return m.group(1)
+    return None
+
+
+# Defaults for ClickHouse homography lookup (can override in .env)
+H_TAG_DEFAULT      = os.getenv("H_TAG", "cam_to_map")
+H_TAG_SHIFTED      = os.getenv("H_TAG_SHIFTED", "cam_to_map_shifted")
+APPROACH_DEFAULT   = os.getenv("APPROACH_ID", "toward_cam_main")
+INTERSECTION_FALLBACK = os.getenv("INTERSECTION_ID_DEFAULT", "1")
 
 #
 # this is messy but we do it because the camera shifts a little
@@ -66,6 +102,23 @@ def select_h_path(video_key: str) -> str:
 
     LOG.info("Using default homography for hiv%03d", n)
     return H_PATH
+
+
+def get_video_duration_seconds(path: Path) -> float:
+    """
+    Return video duration in seconds using ffprobe.
+    Raises on failure.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    return float(out)
 
 
 def env_float(name: str, default: float) -> float:
@@ -101,6 +154,46 @@ def is_night_window(t: dt.time) -> bool:
     True if time-of-day is in [19:00:01, 23:59:59] OR [00:00:00, 06:59:59].
     """
     return (t >= dt.time(19, 0, 1)) or (t <= dt.time(6, 59, 59))
+
+def is_daytime(t: dt.time) -> bool:
+    return DAY_START <= t < DAY_END
+
+DAY_START = dt.time(7, 0, 0)
+DAY_END   = dt.time(19, 0, 1)  # exclusive upper bound
+
+def segment_has_daytime(start: dt.datetime, duration_sec: float) -> bool:
+    """
+    Return True if [start, start+duration) contains any time-of-day
+    in the daytime window [07:00:00, 19:00:01).
+    Assumes duration < 24h (true for your clips).
+    """
+    end = start + dt.timedelta(seconds=duration_sec)
+
+    def intervals_overlap(a_start: dt.datetime, a_end: dt.datetime,
+                          b_start: dt.datetime, b_end: dt.datetime) -> bool:
+        return max(a_start, b_start) < min(a_end, b_end)
+
+    # Daytime window on the start date
+    day1_start = start.replace(hour=DAY_START.hour,
+                               minute=DAY_START.minute,
+                               second=DAY_START.second,
+                               microsecond=0)
+    day1_end = start.replace(hour=DAY_END.hour,
+                             minute=DAY_END.minute,
+                             second=DAY_END.second,
+                             microsecond=0)
+
+    if intervals_overlap(start, end, day1_start, day1_end):
+        return True
+
+    # If the clip crosses midnight, also check the next day's window
+    if end.date() != start.date():
+        day2_start = day1_start + dt.timedelta(days=1)
+        day2_end = day1_end + dt.timedelta(days=1)
+        if intervals_overlap(start, end, day2_start, day2_end):
+            return True
+
+    return False
 
 def ffmpeg_compress(
     in_path: Path,
@@ -390,18 +483,44 @@ def main() -> None:
     # --------------------------
     H_cache: dict[str, Optional[np.ndarray]] = {}
 
-    ortho = None
-    ortho_w = ortho_h = None
-    ortho_transform: Optional[Affine] = None
+    # --------------------------
+    # Ortho cache: per-intersection dataset + metadata
+    # --------------------------
 
-    try:
-        ortho = rio.open(ORTHO_PATH)
-        ortho_w, ortho_h = ortho.width, ortho.height
-        ortho_transform = ortho.transform
-        LOG.info("Loaded ortho: %s size=%sx%s CRS=%s", ORTHO_PATH, ortho_w, ortho_h, ortho.crs)
-    except Exception as e:
-        LOG.error("Could not open ortho %s: %s", ORTHO_PATH, e)
-        ortho = None
+    ortho_cache: Dict[str, Dict[str, Any]] = {}
+
+    def get_ortho_for_intersection(isect_id: str) -> Dict[str, Any]:
+        """
+        Return dict with keys: ds, w, h, transform for this intersection.
+
+        If the ortho can't be opened, all fields except 'ds' will be None.
+        """
+        if isect_id in ortho_cache:
+            return ortho_cache[isect_id]
+
+        path = ORTHO_BY_INTERSECTION.get(isect_id, DEFAULT_ORTHO_PATH)
+        try:
+            ds = rio.open(path)
+            info = {
+                "ds": ds,
+                "w": ds.width,
+                "h": ds.height,
+                "transform": ds.transform,
+            }
+            ortho_cache[isect_id] = info
+            LOG.info(
+                "Loaded ortho for intersection %s: %s size=%sx%s CRS=%s",
+                isect_id, path, info["w"], info["h"], ds.crs,
+            )
+            return info
+        except Exception as e:
+            LOG.error(
+                "Could not open ortho %s for intersection %s: %s",
+                path, isect_id, e,
+            )
+            info = {"ds": None, "w": None, "h": None, "transform": None}
+            ortho_cache[isect_id] = info
+            return info
 
     def cam_to_map_px(H: Optional[np.ndarray], cx: float, cy: float) -> Optional[tuple[float, float]]:
         """(cx,cy) camera px -> (mx,my) ortho px"""
@@ -418,16 +537,20 @@ def main() -> None:
         return float(mx), float(my)
 
 
-    def map_px_to_meters(mx_px: float, my_px: float) -> Optional[tuple[float, float]]:
+    def map_px_to_meters(
+        mx_px: float,
+        my_px: float,
+        transform: Optional[Affine],
+    ) -> Optional[tuple[float, float]]:
         """
         Ortho pixel -> meters.
 
-        ortho_zoom.tif CRS is EPSG:6438 (US survey foot), so affine outputs feet.
+        CRS is EPSG:6438 (US survey foot), so affine outputs feet.
         Convert to meters so map_m_x/map_m_y are truly meters.
         """
-        if ortho_transform is None:
+        if transform is None:
             return None
-        X_ft, Y_ft = ortho_transform * (mx_px, my_px)  # CRS units: US survey feet
+        X_ft, Y_ft = transform * (mx_px, my_px)  # CRS units: US survey feet
         return float(X_ft) * US_SURVEY_FT_TO_M, float(Y_ft) * US_SURVEY_FT_TO_M
 
 
@@ -472,8 +595,8 @@ def main() -> None:
         port=5672,
         virtual_host="/",
         credentials=creds,
-        heartbeat=600,
-        blocked_connection_timeout=300,
+        heartbeat=0,
+        blocked_connection_timeout=None,
     )
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
@@ -497,23 +620,91 @@ def main() -> None:
             if not video_path.is_absolute():
                 video_path = (VIDEO_BASE / video_path).resolve()
 
+            # --- Per-video homography selection + caching (ClickHouse first, file fallback) ---
+            # 1) Figure out intersection + approach + tag
+                    
             video_key = video_path.name
 
-            # --- Per-video homography selection + caching ---
-            this_h_path = select_h_path(video_key)
+            # Intersection + HIV number
+            isect_id = infer_intersection_id_from_path(video_path) or INTERSECTION_FALLBACK
+            hiv_n = parse_hiv_number(video_key)
 
-            if this_h_path not in H_cache:
-                try:
-                    H_tmp = np.load(this_h_path)
-                    if H_tmp.shape != (3, 3):
-                        raise ValueError(f"H must be 3x3, got {H_tmp.shape}")
-                    H_cache[this_h_path] = H_tmp
-                    publish_log(ch, log_queue, f"[ULTRA] Using homography {this_h_path} for {video_key}")
-                except Exception as e:
-                    H_cache[this_h_path] = None
-                    publish_log(ch, log_queue, f"[ULTRA][ERROR] Could not load homography {this_h_path}: {e}")
+            # Tag (shifted vs default)
+            if hiv_n is not None and 415 <= hiv_n <= 427:
+                tag = H_TAG_SHIFTED
+            else:
+                tag = H_TAG_DEFAULT
 
-            H = H_cache[this_h_path]
+            approach_id = APPROACH_DEFAULT
+
+            # Ortho for this intersection
+            ortho_info = get_ortho_for_intersection(isect_id)
+            ortho_w = ortho_info["w"]
+            ortho_h = ortho_info["h"]
+            ortho_transform = ortho_info["transform"]
+
+            # Cache key is logical (intersection, approach, tag)
+            h_key = f"{isect_id}|{approach_id}|{tag}"
+
+            if h_key not in H_cache:
+                H_val: Optional[np.ndarray] = None
+
+                # --- Try ClickHouse first ---
+                if ch_client is not None:
+                    try:
+                        H_val = load_latest_homography_from_clickhouse(
+                            ch_client,
+                            intersection_id=isect_id,
+                            approach_id=approach_id,
+                            tag=tag,
+                        )
+                        if H_val is not None:
+                            publish_log(
+                                ch,
+                                log_queue,
+                                f"[ULTRA] Using ClickHouse H for isect={isect_id}, appr={approach_id}, tag={tag}",
+                            )
+                    except Exception as e:
+                        publish_log(
+                            ch,
+                            log_queue,
+                            f"[ULTRA][ERROR] homography lookup failed for "
+                            f"({isect_id}, {approach_id}, {tag}): {e}",
+                        )
+
+                # --- Fallback: old .npy path logic ---
+                if H_val is None:
+                    this_h_path = select_h_path(video_key)
+                    try:
+                        H_tmp = np.load(this_h_path)
+                        if H_tmp.shape != (3, 3):
+                            raise ValueError(f"H must be 3x3, got {H_tmp.shape}")
+                        H_val = H_tmp
+                        publish_log(
+                            ch,
+                            log_queue,
+                            f"[ULTRA] Using file homography {this_h_path} for {video_key}",
+                        )
+                    except Exception as e:
+                        publish_log(
+                            ch,
+                            log_queue,
+                            f"[ULTRA][ERROR] Could not load homography {this_h_path}: {e}",
+                        )
+                        H_val = None
+
+                H_cache[h_key] = H_val
+
+            H = H_cache[h_key]
+
+            if H is None:
+                msg = f"[ULTRA][WARN] H is None for h_key={h_key}; no map coords will be written"
+                LOG.warning(msg)
+                publish_log(ch, log_queue, msg)
+            else:
+                msg = f"[ULTRA] H loaded for h_key={h_key}, first row={H[0,0]:.6f},{H[0,1]:.6f},{H[0,2]:.6f}"
+                LOG.info(msg)
+                publish_log(ch, log_queue, msg)
 
 
             # --- ClickHouse skip check (optional) ---
@@ -556,27 +747,35 @@ def main() -> None:
                     publish_log(ch, log_queue, f"[ULTRA][WARN] AI timestamp reader failed: {e}")
                     video_start_dt = None
 
-
-            # Refuse to process nighttime videos (drop message; do NOT requeue)
-            if video_start_dt is not None:
-                tod = video_start_dt.time()
-                if is_night_window(tod):
-                    msg = (
-                        f"[ULTRA] Dropping {video_key} (start={video_start_dt}) "
-                        "— nighttime window 19:00:01–06:59:59"
-                    )
-                    LOG.warning(msg)
-                    publish_log(ch, log_queue, msg)
-                    ch.basic_ack(delivery_tag=method.delivery_tag)  # drop it
-                    return
-            else:
-                # If you want to be strict: drop when timestamp is unknown
-                # (optional; remove if you prefer to process unknowns)
-                msg = f"[ULTRA] Dropping {video_key} — start time unknown (night filter enabled)"
+            # --- New: duration + daytime overlap check ---
+            if video_start_dt is None:
+                msg = f"[ULTRA] Dropping {video_key} — start time unknown (day/night filter)"
                 LOG.warning(msg)
                 publish_log(ch, log_queue, msg)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
+
+            try:
+                dur_sec = get_video_duration_seconds(video_path)
+            except Exception as e:
+                msg = f"[ULTRA][WARN] ffprobe failed for {video_key}: {e}; processing anyway"
+                LOG.warning(msg)
+                publish_log(ch, log_queue, msg)
+                dur_sec = None
+
+            if dur_sec is not None:
+                if not segment_has_daytime(video_start_dt, dur_sec):
+                    # compute end timestamp for logging
+                    end_dt = video_start_dt + dt.timedelta(seconds=dur_sec)
+
+                    msg = (
+                        f"[ULTRA] Dropping {video_key} — no overlap with daytime window "
+                        f"(start={video_start_dt}, end={end_dt}, dur={dur_sec:.1f}s)"
+                    )
+                    LOG.warning(msg)
+                    publish_log(ch, log_queue, msg)
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    return
 
             publish_log(ch, log_queue, f"[ULTRA] Tracking {video_path.name} (alpha={smooth_alpha})")
 
@@ -590,11 +789,14 @@ def main() -> None:
 
                 secs = float(frame_idx) / float(fps or 15.0)
 
-                # DateTime64(3) fallback (non-null)
                 if vstart is None:
                     ts = dt.datetime(1970, 1, 1) + dt.timedelta(seconds=secs)
                 else:
                     ts = vstart + dt.timedelta(seconds=secs)
+
+                # NEW: skip frames outside daytime window
+                if not is_daytime(ts.time()):
+                    return
 
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -605,7 +807,6 @@ def main() -> None:
                     cy = float(y2)
 
                     # --- convert to PAIRER pixel space (1280x720) before applying H ---
-                    # This makes H (fit in 1280x720) valid even if Ultralytics downsized internally.
                     sx = PAIR_W / float(frame_w) if frame_w else 1.0
                     sy = PAIR_H / float(frame_h) if frame_h else 1.0
                     cx_pair = cx * sx
@@ -616,17 +817,32 @@ def main() -> None:
                     map_px_x = map_px_y = map_m_x = map_m_y = None
                     mp = cam_to_map_px(H, cx_pair, cy_pair)
 
+                    if mp is None:
+                        publish_log(
+                            ch,
+                            log_queue,
+                            f"[ULTRA][DEBUG] cam_to_map_px returned None: cx_pair={cx_pair:.1f}, cy_pair={cy_pair:.1f}",
+                        )
+                    elif not (0 <= mp[0] < (ortho_w or 0) and 0 <= mp[1] < (ortho_h or 0)):
+                        publish_log(
+                            ch,
+                            log_queue,
+                            f"[ULTRA][DEBUG] map px outside ortho: mx={mp[0]:.1f}, my={mp[1]:.1f}, "
+                            f"ortho_w={ortho_w}, ortho_h={ortho_h}",
+                        )
+
                     if mp is not None and ortho_w is not None and ortho_h is not None:
                         mx_px, my_px = mp
                         if 0 <= mx_px < ortho_w and 0 <= my_px < ortho_h:
                             map_px_x, map_px_y = mx_px, my_px
-                            mxy = map_px_to_meters(mx_px, my_px)
+                            mxy = map_px_to_meters(mx_px, my_px, ortho_transform)
                             if mxy is not None:
                                 map_m_x, map_m_y = mxy
 
                     ch_rows.append(
                         ",".join([
                             video_key,
+                            str(int(isect_id)),          # <-- NEW: intersection_id
                             str(int(frame_idx)),
                             f"{secs:.6f}",
                             ts_str,
@@ -706,11 +922,14 @@ def main() -> None:
             connection.close()
         except Exception:
             pass
-        try:
-            if ortho is not None:
-                ortho.close()
-        except Exception:
-            pass
+        # Close all opened ortho datasets
+        for info in ortho_cache.values():
+            try:
+                ds = info.get("ds")
+                if ds is not None:
+                    ds.close()
+            except Exception:
+                pass
 
 
 

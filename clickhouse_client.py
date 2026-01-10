@@ -14,8 +14,7 @@ Usage example:
     )
 
     rows = [
-        "video1.mp4,0,0.0,2025-11-08 10:00:00.000,1,car,100,200,50,60,12.34,56.78\n",
-        "video1.mp4,1,0.07,2025-11-08 10:00:00.070,1,car,101,201,51,61,12.35,56.79\n",
+        "video1.mp4,1,0,0.0,2025-11-08 10:00:00.000,1,car,100,200,50,60,12.34,56.78\n",
     ]
     ch.insert_csv_rows(rows)
 """
@@ -71,8 +70,19 @@ class ClickHouseHTTP:
 
 
         self.header = ",".join([
-            "video", "frame", "secs", "timestamp", "track_id", "class",
-            "cam_x", "cam_y", "map_px_x", "map_px_y", "map_m_x", "map_m_y"
+            "video",
+            "intersection_id",
+            "frame",
+            "secs",
+            "timestamp",
+            "track_id",
+            "class",
+            "cam_x",
+            "cam_y",
+            "map_px_x",
+            "map_px_y",
+            "map_m_x",
+            "map_m_y",
         ]) + "\n"
 
         # Ensure DB + table exist (best-effort; failures are logged)
@@ -140,25 +150,27 @@ class ClickHouseHTTP:
 
         # 2) Create table in that database
         # Schema matches the CSV header:
-        # video,frame,secs,timestamp,track_id,class,cam_x,cam_y,map_px_x,map_px_y,map_m_x,map_m_y
+        # video,intersection_id,frame,secs,timestamp,track_id,class,
+        # cam_x,cam_y,map_px_x,map_px_y,map_m_x,map_m_y
         sql_table = f"""
         CREATE TABLE IF NOT EXISTS {self.db}.raw
         (
-            video      String,
-            frame      UInt32,
-            secs       Float64,
-            timestamp  DateTime64(3),
-            track_id   UInt32,
-            class      String,
-            cam_x      Float64,
-            cam_y      Float64,
-            map_px_x   Float64,
-            map_px_y   Float64,
-            map_m_x    Float64,
-            map_m_y    Float64
+            video           String,
+            intersection_id UInt8,
+            frame           UInt32,
+            secs            Float64,
+            timestamp       DateTime64(3),
+            track_id        UInt32,
+            class           String,
+            cam_x           Float64,
+            cam_y           Float64,
+            map_px_x        Float64,
+            map_px_y        Float64,
+            map_m_x         Float64,
+            map_m_y         Float64
         )
         ENGINE = MergeTree
-        ORDER BY (video, track_id, frame)
+        ORDER BY (video, intersection_id, track_id, frame)
         """
         self.logger.info(f"Ensuring ClickHouse table exists: {self.db}.raw")
         self._post_sql(sql_table, use_db=False)
