@@ -94,13 +94,21 @@ class ClickHouseHTTP:
 
     # ------------------------------------------------------------------
 
-    def video_already_ingested(self, video: str) -> bool:
+    def video_already_ingested(self, video: str, intersection_id: Optional[int] = None) -> bool:
         """
-        Return True if any rows already exist in {db}.raw for the given video.
+        Return True if rows already exist in {db}.raw for the given video.
+        If intersection_id is provided, require that as well.
         """
         # Very simple escaping of single quotes
         safe_video = video.replace("'", "\\'")
-        sql = f"SELECT count() FROM {self.db}.raw WHERE video = '{safe_video}'"
+
+        if intersection_id is None:
+            sql = f"SELECT count() FROM {self.db}.raw WHERE video = '{safe_video}'"
+        else:
+            sql = (
+                f"SELECT count() FROM {self.db}.raw "
+                f"WHERE video = '{safe_video}' AND intersection_id = {int(intersection_id)}"
+            )
 
         try:
             resp = self._post_sql(sql, use_db=False)

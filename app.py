@@ -106,19 +106,62 @@ def select_h_path(video_key: str) -> str:
 
 def get_video_duration_seconds(path: Path) -> float:
     """
-    Return video duration in seconds using ffprobe.
-    Raises on failure.
+    Return video duration in seconds using mediainfo only.
+
+    - Runs mediainfo with a hard timeout.
+    - Returns duration in seconds as float.
+    - Raises RuntimeError if mediainfo is missing, times out, fails,
+      or returns an invalid/zero duration.
+
+      P.S. we use mediainfo because ffprobe sometimes returns unreliable
+      or straight up wrong durations for broken containers
     """
     cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "mediainfo",
+        "--Inform=General;%Duration%",
         str(path),
     ]
-    out = subprocess.check_output(cmd, text=True).strip()
-    return float(out)
+    LOG.info("[ULTRA] Running mediainfo for %s", path)
+
+    try:
+        res = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=5.0,   # do NOT let this hang forever
+            check=True,
+        )
+    except FileNotFoundError as e:
+        LOG.error("[ULTRA] mediainfo not found for %s: %s", path, e)
+        raise RuntimeError(f"mediainfo not found when reading duration for {path}") from e
+    except subprocess.TimeoutExpired as e:
+        LOG.error("[ULTRA] mediainfo timeout for %s: %s", path, e)
+        raise RuntimeError(f"mediainfo timed out when reading duration for {path}") from e
+    except subprocess.CalledProcessError as e:
+        LOG.error(
+            "[ULTRA] mediainfo failed for %s: returncode=%s stderr=%r",
+            path, e.returncode, e.stderr,
+        )
+        raise RuntimeError(f"mediainfo failed when reading duration for {path}") from e
+
+    out = res.stdout.strip()
+    if not out:
+        LOG.error("[ULTRA] mediainfo returned empty duration for %s", path)
+        raise RuntimeError(f"mediainfo returned empty duration for {path}")
+
+    try:
+        ms = float(out)
+    except ValueError as e:
+        LOG.error("[ULTRA] mediainfo returned non-numeric duration for %s: %r", path, out)
+        raise RuntimeError(f"mediainfo returned non-numeric duration for {path}") from e
+
+    if ms <= 0:
+        LOG.error("[ULTRA] mediainfo returned non-positive duration for %s: %s", path, ms)
+        raise RuntimeError(f"mediainfo returned non-positive duration for {path}")
+
+    sec = ms / 1000.0
+    LOG.info("[ULTRA] mediainfo duration for %s: %.3f sec", path, sec)
+    return sec
 
 
 def env_float(name: str, default: float) -> float:
@@ -601,7 +644,14 @@ def main() -> None:
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
 
-    channel.queue_declare(queue=in_queue, durable=False)
+    # bump to 2 hours = 7,200,000 ms (or whatever you want)
+    CONSUMER_TIMEOUT_MS = int(os.getenv("CONSUMER_TIMEOUT_MS", "7200000"))
+
+    channel.queue_declare(
+        queue=in_queue,
+        durable=False,
+        arguments={"x-consumer-timeout": CONSUMER_TIMEOUT_MS},
+    )
     channel.queue_declare(queue=log_queue, durable=False)
     channel.queue_declare(queue=qname, durable=False)
 
@@ -710,14 +760,18 @@ def main() -> None:
             # --- ClickHouse skip check (optional) ---
             if ch_client is not None:
                 try:
-                    if ch_client.video_already_ingested(video_key):
-                        msg = f"[ULTRA] Skipping {video_key} — already in ClickHouse"
+                    if ch_client.video_already_ingested(video_key, int(isect_id)):
+                        msg = f"[ULTRA] Skipping {video_key} — already in ClickHouse for intersection {isect_id}"
                         LOG.warning(msg)
                         publish_log(ch, log_queue, msg)
                         ch.basic_ack(delivery_tag=method.delivery_tag)
                         return
                 except Exception as e:
-                    publish_log(ch, log_queue, f"[ULTRA][WARN] CH skip-check failed for {video_key}: {e}")
+                    publish_log(
+                        ch,
+                        log_queue,
+                        f"[ULTRA][WARN] CH skip-check failed for {video_key}: {e}"
+                    )
                     # fall through and process anyway
 
 
@@ -736,14 +790,17 @@ def main() -> None:
             # AI timestamp (optional)
             video_start_dt: Optional[dt.datetime] = None
             if use_ai_ts:
+                LOG.info("[ULTRA] Calling infer_video_start_time for %s", video_key)
                 try:
                     from ai_timestamp_reader import infer_video_start_time
                     video_start_dt = infer_video_start_time(str(video_path), logger=LOG)
+                    LOG.info("[ULTRA] infer_video_start_time returned: %r", video_start_dt)
                     if video_start_dt is not None:
                         publish_log(ch, log_queue, f"[ULTRA] AI start time {video_key}: {video_start_dt}")
                     else:
                         publish_log(ch, log_queue, f"[ULTRA][WARN] AI start time not found for {video_key}")
                 except Exception as e:
+                    LOG.exception("AI timestamp reader crashed")
                     publish_log(ch, log_queue, f"[ULTRA][WARN] AI timestamp reader failed: {e}")
                     video_start_dt = None
 
@@ -756,9 +813,11 @@ def main() -> None:
                 return
 
             try:
+                LOG.info("[ULTRA] Before get_video_duration_seconds for %s", video_key)
                 dur_sec = get_video_duration_seconds(video_path)
+                LOG.info("[ULTRA] Duration for %s: %s sec", video_key, dur_sec)
             except Exception as e:
-                msg = f"[ULTRA][WARN] ffprobe failed for {video_key}: {e}; processing anyway"
+                msg = f"[ULTRA][WARN] mediainfo failed for {video_key}: {e}; processing anyway"
                 LOG.warning(msg)
                 publish_log(ch, log_queue, msg)
                 dur_sec = None
