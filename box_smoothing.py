@@ -117,7 +117,21 @@ class BoxSmootherEMA:
                     rw = float(np.clip(rw, st.w * (1.0 - frac), st.w * (1.0 + frac)))
                     rh = float(np.clip(rh, st.h * (1.0 - frac), st.h * (1.0 + frac)))
 
-            # keep center responsive (no lag)
+            # Keep the center detector/tracker driven instead of EMA-smoothed.
+            #
+            # A previous experiment smoothed center position, added reacquisition easing,
+            # and tried to reject sudden "teleport" jumps for a reused track id. It made
+            # annotated videos look calmer, but it was a poor fit for roadside traffic
+            # tracking because the smoothed center lags behind the actual vehicle. That
+            # lag can move line-crossing timestamps, homography/map projections, lane
+            # assignment, speed estimates, queue position, and dwell-time measurements.
+            #
+            # It also mixed responsibilities: BoT-SORT should own identity association
+            # and motion continuity, while this post-process should only reduce detector
+            # box breathing. Hiding association mistakes here can make the drawing look
+            # nicer while preserving a bad track id underneath, which is worse for
+            # analytics and harder to debug. For that reason we leave cx/cy responsive
+            # and only smooth w/h.
             st.cx = rcx
             st.cy = rcy
 
@@ -128,7 +142,6 @@ class BoxSmootherEMA:
             st.last_frame = frame_idx
 
             out[i] = cxcywh_to_xyxy(st.cx, st.cy, st.w, st.h)
-
 
         self._cleanup(frame_idx)
         return out
