@@ -16,7 +16,7 @@ HOST_PIPE ?= /data/video_pipeline
 GPU ?= all
 
 # --- Hardcoded Ultralytics runtime defaults ---
-MODEL   := yolo11m.pt
+MODEL   := yolo11l.pt
 TRACKER := /usr/src/app/trackers/botsort_traffic.yaml
 IMGSZ   := 960
 CONF    := 0.35
@@ -26,8 +26,8 @@ OUT_DIR := /mnt/video_pipeline/tracking_ultra
 DEVICE  := 0
 
 # --- Hardcoded smoothing + drawing defaults ---
-SMOOTH_ALPHA         := 0.15
-SMOOTH_STATIONARY_PX := 2.5
+SMOOTH_ALPHA         := 0.16
+SMOOTH_STATIONARY_PX := 3.5
 SMOOTH_MAX_SIZE_FRAC := 0.015
 FONT_SCALE           := 0.40
 TEXT_THICKNESS	     := 2
@@ -83,3 +83,6 @@ logs:
 
 stop down:
 	-docker rm -f $(NAME) >/dev/null 2>&1 || true
+
+bash:
+	docker exec -it $(NAME) /bin/bash

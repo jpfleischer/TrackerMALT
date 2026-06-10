@@ -4,7 +4,7 @@ tracker_type: botsort
 # stricter update rules -> reduces "breathing" boxes (still detector-driven though)
 track_high_thresh: 0.65
 track_low_thresh: 0.20
-new_track_thresh: 0.75
+new_track_thresh: 0.65
 
 track_buffer: 60
 match_thresh: 0.85
